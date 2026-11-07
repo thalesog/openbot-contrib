@@ -77,6 +77,18 @@ const logger = createOpenBotLogger("provider-runtime");
  */
 const PI_TURN_STALL_MS = 10 * 60_000;
 
+/** How often the partial output of a running tool may replace the renderer's activity line. */
+const PI_TOOL_PROGRESS_INTERVAL_MS = 500;
+
+/** The longest line of a tool's partial output that the activity line shows. */
+const PI_TOOL_PROGRESS_CHARACTERS = 160;
+
+/**
+ * How long Pi may send no event before OpenBot repeats the turn's progress line. A retry, a tool
+ * or a compaction can run for a minute with no other event, and the chat then looked idle.
+ */
+const PI_PROGRESS_HEARTBEAT_MS = 20_000;
+
 /**
  * How long `pi update --models` may take before the model list is read without it. It took 0.7 s in
  * Pi 1.5.0, and the catalog waits 5 s for each `model/list` request.
@@ -156,6 +168,8 @@ interface PiTurn {
   lastActivityAt: number;
   /** Tool calls that started and did not end. The turn is not stalled while one is open. */
   openTools: Set<string>;
+  /** The last progress line of each running tool call, to throttle its partial output. */
+  toolProgress: Map<string, { detail: string; at: number }>;
   /** Questions that wait for the user. The turn is not stalled while one is open. */
   waitingOnUser: number;
   /** Pi compacts the session. The turn is not stalled meanwhile. */
@@ -750,6 +764,7 @@ export class PiAgentClient extends EventEmitter<ClientEvents> implements AgentCl
       finishing: false,
       lastActivityAt: Date.now(),
       openTools: new Set(),
+      toolProgress: new Map(),
       waitingOnUser: 0,
       compacting: false,
       stalled: null,
@@ -773,6 +788,7 @@ export class PiAgentClient extends EventEmitter<ClientEvents> implements AgentCl
       { startImmediately: true },
     );
     yield* Effect.forkIn(this.#watchStall(thread, turn), this.#scope);
+    yield* Effect.forkIn(this.#watchProgress(thread, turn), this.#scope);
     return { turn: { id: turn.id, status: "inProgress" }, turnId: turn.id };
   });
 
@@ -797,6 +813,28 @@ export class PiAgentClient extends EventEmitter<ClientEvents> implements AgentCl
       yield* thread.rpc.request({ type: "clear_queue" }).pipe(Effect.ignore);
       yield* thread.rpc.request({ type: "abort" }).pipe(Effect.ignore);
       yield* this.#finish(thread, "failed", failure, "stalled");
+    }
+  });
+
+  /** Repeats the turn's progress line while Pi sends nothing, so the chat does not look idle. */
+  readonly #watchProgress = Effect.fn("PiAgentClient.watchProgress")(function* (
+    this: PiAgentClient,
+    thread: PiThread,
+    turn: PiTurn,
+  ) {
+    while (thread.turn === turn && !turn.finishing && !turn.stopped) {
+      yield* Effect.sleep(PI_PROGRESS_HEARTBEAT_MS);
+      if (thread.turn !== turn || turn.finishing || turn.stopped) return;
+      // The line itself is not activity. The turn's last activity stays, so the 10 minute stall still works.
+      if (Date.now() - turn.lastActivityAt < PI_PROGRESS_HEARTBEAT_MS || turn.waitingOnUser > 0) continue;
+      const provider = agentProviderName(this.provider);
+      const detail =
+        turn.openTools.size > 0
+          ? sourceText("status.agent.toolStepWorking")
+          : turn.compacting
+            ? sourceText("status.provider.compacting", { provider })
+            : sourceText("status.provider.waitingForReply", { provider });
+      this.#notify("openbot/turn-progress", thread, { detail });
     }
   });
 
@@ -906,6 +944,22 @@ export class PiAgentClient extends EventEmitter<ClientEvents> implements AgentCl
       );
     } else if (record.type === "compaction_start" || record.type === "compaction_end") {
       turn.compacting = record.type === "compaction_start";
+      // A compaction that OpenBot asked for runs as a `manual` compaction. OpenBot already shows its
+      // own progress, so a manual compaction adds no activity line here.
+      if (getString(record, "reason") === "manual") return;
+      if (record.type === "compaction_start") {
+        this.#notify("openbot/turn-progress", thread, {
+          detail: sourceText("status.provider.compacting", { provider: agentProviderName(this.provider) }),
+        });
+        return;
+      }
+      // An aborted compaction keeps the context, and is no failure for the user.
+      this.#notify("openbot/turn-progress", thread, {
+        detail: sourceText(
+          record.errorMessage !== undefined ? "status.provider.compactionFailed" : "status.provider.compacted",
+          { provider: agentProviderName(this.provider) },
+        ),
+      });
     } else if (record.type === "message_update") {
       const update = getRecord(record, "assistantMessageEvent");
       const kind = getString(update, "type");
@@ -939,8 +993,10 @@ export class PiAgentClient extends EventEmitter<ClientEvents> implements AgentCl
       const id = getString(record, "toolCallId");
       if (!id) return;
       const done = record.type === "tool_execution_end";
-      if (done) turn.openTools.delete(id);
-      else turn.openTools.add(id);
+      if (done) {
+        turn.openTools.delete(id);
+        turn.toolProgress.delete(id);
+      } else turn.openTools.add(id);
       const item: ThreadItem = {
         ...turn.items.get(id),
         id,
@@ -955,6 +1011,18 @@ export class PiAgentClient extends EventEmitter<ClientEvents> implements AgentCl
         item,
         filePaths: piToolFilePaths(item.tool, item.arguments, thread.cwd),
       });
+    } else if (record.type === "tool_execution_update") {
+      // A long tool such as a shell command writes output between its start and its end.
+      const id = getString(record, "toolCallId");
+      if (!id) return;
+      const text = piToolProgressDetail(piText(getRecord(record, "partialResult")?.content));
+      // A tool that reports an empty update still needs its own line while it runs.
+      const detail = text || sourceText("status.agent.toolStepWorking");
+      const previous = turn.toolProgress.get(id);
+      const at = Date.now();
+      if (previous && (previous.detail === detail || at - previous.at < PI_TOOL_PROGRESS_INTERVAL_MS)) return;
+      turn.toolProgress.set(id, { detail, at });
+      this.#notify("openbot/turn-progress", thread, { detail });
     }
   }
 
@@ -1203,4 +1271,14 @@ function piToolFilePaths(tool: unknown, args: unknown, cwd: string): string[] | 
   const home = path.startsWith("~/") || (process.platform === "win32" && path.startsWith("~\\"));
   if (path === "~" || home) return [resolve(homedir(), path.slice(2))];
   return [resolve(cwd, path)];
+}
+
+/**
+ * The last non-empty line of a tool's partial output, on one line and short enough for the activity
+ * line. A control character cannot break the line, and a long line is cut.
+ */
+function piToolProgressDetail(text: string): string {
+  const line = text.split(/\r?\n/u).findLast((value) => value.trim().length > 0) ?? "";
+  const detail = line.replace(/[\p{Cc}\p{Cf}\s]+/gu, " ").trim();
+  return Array.from(detail).slice(0, PI_TOOL_PROGRESS_CHARACTERS).join("");
 }

@@ -12,4 +12,9 @@ export const messages = defineMessages("status.provider", {
   "status.provider.retryServerError":
     "The {provider} server is busy or has an error. Retry {attempt} of {maxAttempts}.",
   "status.provider.retryRecovered": "{provider} gets answers from its server again.",
+  // Provider work that sends no answer for a while.
+  "status.provider.waitingForReply": "Waiting for {provider} to answer…",
+  "status.provider.compacting": "{provider} compacts its context. This can take a minute.",
+  "status.provider.compacted": "{provider} compacted its context. The turn continues.",
+  "status.provider.compactionFailed": "{provider} could not compact its context.",
 });

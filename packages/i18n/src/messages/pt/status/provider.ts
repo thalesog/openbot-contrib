@@ -12,4 +12,8 @@ export const messages = {
   "status.provider.retryServerError":
     "O servidor do {provider} está ocupado ou com erro. Nova tentativa {attempt} de {maxAttempts}.",
   "status.provider.retryRecovered": "{provider} voltou a receber respostas do servidor.",
+  "status.provider.waitingForReply": "Aguardando resposta de {provider}…",
+  "status.provider.compacting": "O {provider} está compactando o contexto. Isso pode levar um minuto.",
+  "status.provider.compacted": "O {provider} compactou o contexto. O turno continua.",
+  "status.provider.compactionFailed": "O {provider} não conseguiu compactar o contexto.",
 } as const satisfies PartialTranslation<typeof source>;
